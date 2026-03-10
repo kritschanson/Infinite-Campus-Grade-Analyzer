@@ -524,7 +524,23 @@ function App() {
 
           // Subgroup file
           if (lname.includes("subgroup")) {
-            setSubgroupMap(parseSubgroupCSV(rows));
+            // Merge into existing subgroup map so multiple teacher CSVs accumulate
+            const newEntries = parseSubgroupCSV(rows);
+            setSubgroupMap(prev => {
+              if (!prev) return newEntries;
+              const merged = { ...prev };
+              Object.entries(newEntries).forEach(([key, val]) => {
+                if (!merged[key]) {
+                  merged[key] = val;
+                } else {
+                  // Merge subgroups for students that appear in multiple files
+                  val.subgroups.forEach(sg => {
+                    if (!merged[key].subgroups.includes(sg)) merged[key].subgroups.push(sg);
+                  });
+                }
+              });
+              return merged;
+            });
             return;
           }
           // Prior analytics (optional, cross-trimester only)
@@ -673,7 +689,7 @@ function App() {
             {/* Status badges */}
             <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: sections.length > 0 ? "1.25rem" : 0 }}>
               <span style={{ background: subgroupMap ? "#dcfce7" : "#f1f5f9", color: subgroupMap ? "#15803d" : "#64748b", borderRadius: 20, padding: "0.2rem 0.65rem", fontSize: "0.72rem", fontWeight: 700, border: "1px solid " + (subgroupMap ? "#86efac" : "#e2e8f0") }}>
-                {subgroupMap ? "✓ Subgroup data loaded" : "○ No subgroup data"}
+                {subgroupMap ? `✓ Subgroup data loaded — ${Object.keys(subgroupMap).length} students` : "○ No subgroup data"}
               </span>
               {priorMap && (
                 <span style={{ background: "#dcfce7", color: "#15803d", borderRadius: 20, padding: "0.2rem 0.65rem", fontSize: "0.72rem", fontWeight: 700, border: "1px solid #86efac" }}>
