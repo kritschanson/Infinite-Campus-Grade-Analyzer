@@ -144,45 +144,82 @@ function parseICGradebook(rows, teacherLabel) {
 // Col 2+: Category columns (e.g. "Program", "Language") where cell value = subgroup label
 //         Any non-blank cell value = student belongs to that subgroup with that label
 //         e.g. row: "Ahmed, Aseel, 888206511, IEP, ELL" → subgroups: ["IEP", "ELL"]
+// Parse IC subgroup CSV.
+// Expected format (IC export):
+//   Col 0 "Student"  — "LastName, First MI #StudentID"  (same format as gradebook)
+//   Col 1 "Sub Group" — subgroup label e.g. "IEP", "ELL"
+// One row per membership; a student in two subgroups appears on two rows.
+//
+// Also handles a wide column-per-subgroup format as a fallback:
+//   Col 0: name/combined, Col 1: ID, Col 2+: subgroup category columns
 function parseSubgroupCSV(rows) {
   if (!rows.length) return {};
   const headers = rows[0].map(h => h.trim());
 
-  // Find name and ID columns by header name, defaulting to cols 0 and 1
+  // Helper: parse an IC-style combined student cell "Last, First MI #ID"
+  const parseStudentCell = (raw) => {
+    const idMatch = raw.match(/#(\d+)/);
+    const studentId = idMatch ? idMatch[1] : "";
+    const namePart = raw.replace(/#\d+/, "").trim().replace(/,\s*$/, "").trim();
+    const ci = namePart.indexOf(",");
+    let name;
+    if (ci !== -1) {
+      const last  = namePart.slice(0, ci).trim();
+      const first = namePart.slice(ci + 1).trim();
+      name = first ? `${first} ${last}` : last;
+    } else {
+      name = namePart;
+    }
+    return { name, studentId };
+  };
+
+  // Detect format:
+  // IC format: header col 0 matches "student", col 1 matches "sub group"
+  const h0 = headers[0] || "";
+  const h1 = headers[1] || "";
+  const isICFormat = /^student$/i.test(h0) && /sub\s*group/i.test(h1);
+
+  const map = {};
+
+  if (isICFormat) {
+    // One row per membership — col 0 = combined student cell, col 1 = subgroup label
+    rows.slice(1).forEach(row => {
+      const raw = (row[0] || "").trim();
+      const sg  = (row[1] || "").trim();
+      if (!raw || !sg) return;
+      const { name, studentId } = parseStudentCell(raw);
+      const key = studentId || name;
+      if (!map[key]) map[key] = { name, id: studentId, subgroups: [] };
+      if (!map[key].subgroups.includes(sg)) map[key].subgroups.push(sg);
+    });
+    return map;
+  }
+
+  // Fallback: wide format — separate name/ID columns + subgroup value columns
   const nameIdx = (() => {
-    const i = headers.findIndex(h => /student\s*name|^name$/i.test(h));
+    const i = headers.findIndex(h => /student\s*name|^name$|^student$/i.test(h));
     return i !== -1 ? i : 0;
   })();
   const idIdx = (() => {
     const i = headers.findIndex(h => /student\s*id|^id$|^#/i.test(h));
-    return i !== -1 ? i : 1;
+    return i !== -1 ? i : -1;
   })();
-
-  // All remaining columns are subgroup category columns
   const sgColIdxs = headers.map((_, i) => i).filter(i => i !== nameIdx && i !== idIdx);
 
-  const map = {};
   rows.slice(1).forEach(row => {
-    const rawName = (row[nameIdx] || "").trim();
-    const rawId   = (row[idIdx]   || "").trim().replace(/^#/, ""); // strip leading #
-    if (!rawName && !rawId) return;
-
-    // Normalise name: "Last, First" → "First Last" if comma present
-    let name = rawName;
-    const ci = rawName.indexOf(",");
-    if (ci !== -1) {
-      const last  = rawName.slice(0, ci).trim();
-      const first = rawName.slice(ci + 1).trim();
-      name = first ? `${first} ${last}` : last;
+    const rawCell = (row[nameIdx] || "").trim();
+    if (!rawCell) return;
+    // If the cell contains a # it's likely an IC combined cell
+    let name, studentId;
+    if (rawCell.includes("#")) {
+      ({ name, studentId } = parseStudentCell(rawCell));
+    } else {
+      name = rawCell;
+      studentId = idIdx !== -1 ? (row[idIdx] || "").trim().replace(/^#/, "") : "";
     }
-
-    const subgroups = sgColIdxs
-      .map(i => (row[i] || "").trim())
-      .filter(Boolean); // any non-blank value = membership label
-
-    const key = rawId || name;
-    if (!map[key]) map[key] = { name, id: rawId, subgroups: [] };
-    // Merge subgroups in case of duplicate rows
+    const subgroups = sgColIdxs.map(i => (row[i] || "").trim()).filter(Boolean);
+    const key = studentId || name;
+    if (!map[key]) map[key] = { name, id: studentId, subgroups: [] };
     subgroups.forEach(sg => {
       if (!map[key].subgroups.includes(sg)) map[key].subgroups.push(sg);
     });
@@ -563,7 +600,8 @@ function App() {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "#f1f5f9" }}>
       {/* Header */}
-      <div style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%)", padding: "0.9rem 1.5rem", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+      <div style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%)", padding: "0.9rem 1.5rem", flexShrink: 0 }}>
+        <div style={{ maxWidth: 1100, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
           <div style={{ width: 36, height: 36, background: "rgba(20,184,166,0.25)", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.1rem" }}>📊</div>
           <div>
@@ -578,20 +616,24 @@ function App() {
             <span style={{ background: "rgba(20,184,166,0.2)", color: "#5eead4", borderRadius: 6, padding: "0.25rem 0.65rem", fontSize: "0.8rem", fontWeight: 700 }}>{currentAssessmentName}</span>
           </div>
         )}
+        </div>
       </div>
 
       {/* Tabs */}
-      <div className="no-print" style={{ background: "white", borderBottom: "1px solid #e2e8f0", display: "flex", padding: "0 1.5rem", flexShrink: 0 }}>
+      <div className="no-print" style={{ background: "white", borderBottom: "1px solid #e2e8f0", flexShrink: 0 }}>
+        <div style={{ maxWidth: 1100, margin: "0 auto", display: "flex", padding: "0 1.5rem" }}>
         {[["upload","📁 Upload"],["data","📋 Data"],["analysis","📈 Analysis"]].map(([key, label]) => (
           <button key={key} onClick={() => setActiveTab(key)}
             style={{ background: "none", border: "none", borderBottom: activeTab === key ? "3px solid #0f766e" : "3px solid transparent", color: activeTab === key ? "#0f766e" : "#64748b", fontFamily: "inherit", fontWeight: 700, fontSize: "0.82rem", padding: "0.75rem 1.1rem", cursor: "pointer", transition: "all 0.15s" }}>
             {label} {key === "data" && sections.length > 0 && <span style={{ background: "#f0fdfa", color: "#0f766e", borderRadius: 20, padding: "0.05rem 0.4rem", fontSize: "0.68rem", marginLeft: "0.2rem", fontWeight: 800 }}>{sections.length}</span>}
           </button>
         ))}
+        </div>
       </div>
 
       {/* Main Content */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "1.25rem 1.5rem" }}>
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        <div style={{ maxWidth: 1100, margin: "0 auto", padding: "1.25rem 1.5rem" }}>
 
         {error && (
           <div className="no-print" style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 8, padding: "0.6rem 1rem", marginBottom: "1rem", color: "#dc2626", fontSize: "0.82rem", fontWeight: 600 }}>
@@ -1132,6 +1174,7 @@ function App() {
         })()}
 
 
+        </div>
       </div>
     </div>
   );
