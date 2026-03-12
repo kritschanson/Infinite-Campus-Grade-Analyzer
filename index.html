@@ -227,18 +227,32 @@ function parseSubgroupCSV(rows) {
   return map;
 }
 
-// Parse prior analytics CSV
+// Parse prior analytics CSV.
+// Columns: StudentID, StudentName, Subgroups,
+//   then per assessment: AssessName|Date, AssessName|Score, AssessName|Reassessed (optional)
+// |Reassessed stores the original pre-reassessment score; blank if no reassessment occurred.
 function parsePriorAnalyticsCSV(rows) {
   if (!rows.length) return {};
   const headers = rows[0].map(h => h.trim());
   const fixedCols = 3;
+
+  // Detect assessments — columns after the fixed 3 come in groups of 2 or 3:
+  //   AssessName|Date, AssessName|Score, [AssessName|Reassessed]
   const assessments = [];
-  for (let i = fixedCols; i < headers.length - 1; i += 2) {
-    const dateCol = headers[i];
-    const scoreCol = headers[i + 1];
-    const name = dateCol.replace(/\|Date$/, "").trim();
-    assessments.push({ name, dateColIdx: i, scoreColIdx: i + 1 });
+  let i = fixedCols;
+  while (i < headers.length) {
+    const h = headers[i];
+    if (h.endsWith("|Date")) {
+      const name = h.replace(/\|Date$/, "").trim();
+      const scoreIdx = i + 1 < headers.length && headers[i + 1] === name + "|Score" ? i + 1 : -1;
+      const reassessIdx = i + 2 < headers.length && headers[i + 2] === name + "|Reassessed" ? i + 2 : -1;
+      assessments.push({ name, dateColIdx: i, scoreColIdx: scoreIdx, reassessColIdx: reassessIdx });
+      i += reassessIdx !== -1 ? 3 : 2;
+    } else {
+      i++;
+    }
   }
+
   const map = {};
   rows.slice(1).forEach(row => {
     const id = (row[0] || "").trim();
@@ -249,8 +263,11 @@ function parsePriorAnalyticsCSV(rows) {
     const history = [];
     assessments.forEach(a => {
       const date = (row[a.dateColIdx] || "").trim();
-      const score = parseFloat(row[a.scoreColIdx]);
-      if (date && !isNaN(score)) history.push({ assessment: a.name, date, score });
+      const score = a.scoreColIdx !== -1 ? parseFloat(row[a.scoreColIdx]) : NaN;
+      if (!date || isNaN(score)) return;
+      const reassessedRaw = a.reassessColIdx !== -1 ? (row[a.reassessColIdx] || "").trim() : "";
+      const originalScore = reassessedRaw !== "" ? parseFloat(reassessedRaw) : null;
+      history.push({ assessment: a.name, date, score, originalScore });
     });
     map[key] = { name, id, subgroups, history };
   });
@@ -384,14 +401,53 @@ function buildGrowthData(sections, assessmentName, subgroupMap, priorMap) {
     // Full ordered history: cross-term (oldest) + in-file (newest prior columns)
     const history = [...crossTermHistory, ...stu.history];
 
-    const currentEntry = { assessment: assessmentName, score: stu.pct };
+    // ── Reassessment detection ──────────────────────────────────────────────
+    // Compare EVERY column in the current IC file against the score stored in
+    // the prior Analytics CSV for that same assessment name.
+    // Score went up → reassessment occurred on that assessment.
+    // Returns an array so a student who reassessed on multiple tests is fully captured.
+    const reassessedAssessments = []; // [{ assessment, originalPct, newPct, crossedProficiency }]
+
+    if (pr) {
+      // Check all history columns (prior assessments in this IC file)
+      stu.history.forEach(h => {
+        const priorEntry = pr.history.find(p => p.assessment === h.assessment);
+        if (priorEntry && h.score > priorEntry.score) {
+          reassessedAssessments.push({
+            assessment: h.assessment,
+            originalPct: priorEntry.score,
+            newPct: h.score,
+            crossedProficiency: priorEntry.score < 70 && h.score >= 70,
+          });
+        }
+      });
+      // Check current (most recent) assessment
+      const priorCurrent = pr.history.find(p => p.assessment === assessmentName);
+      if (priorCurrent && stu.pct > priorCurrent.score) {
+        reassessedAssessments.push({
+          assessment: assessmentName,
+          originalPct: priorCurrent.score,
+          newPct: stu.pct,
+          crossedProficiency: priorCurrent.score < 70 && stu.pct >= 70,
+        });
+      }
+    }
+
+    // For backward compat with proficiency display — did any reassessment on the
+    // current assessment cross into proficiency?
+    const currentReassess = reassessedAssessments.find(r => r.assessment === assessmentName);
+    const reassessedFrom = currentReassess ? currentReassess.originalPct : null;
+    const crossedProficiency = currentReassess ? currentReassess.crossedProficiency : false;
+
+    const currentEntry = { assessment: assessmentName, score: stu.pct, originalScore: reassessedFrom };
     const proficient = stu.pct >= 70;
 
     // Build the full score sequence (history scores + current) for risk calculation
     const allScores = [...history.map(h => h.score), stu.pct];
     const riskStatus = computeRiskStatus(allScores);
 
-    return { ...stu, subgroups, history, currentEntry, riskStatus, proficient };
+    return { ...stu, subgroups, history, currentEntry, riskStatus, proficient,
+             reassessedFrom, crossedProficiency, reassessedAssessments };
   });
 
   // ── Subgroup stats ────────────────────────────────────────────────────────
@@ -429,7 +485,69 @@ function buildGrowthData(sections, assessmentName, subgroupMap, priorMap) {
     });
   }
 
-  return { enriched, subgroupStats, classAvg, totalStudents };
+  // ── Reassessment list ────────────────────────────────────────────────────
+  // One row per student who reassessed on at least one assessment.
+  // Each entry includes all the assessments they reassessed on, sorted by
+  // their lowest original score (most struggling students first within each grade band).
+  // Top-level sort: by original score on the LOWEST-scoring reassessed assessment desc
+  // so the table groups A→B→C→D→F reassessors naturally.
+  const reassessments = enriched
+    .filter(s => s.reassessedAssessments.length > 0)
+    .sort((a, b) => {
+      // Sort by the highest original score among their reassessed assessments (desc)
+      // so students who were already proficient sort first, then C, D, F
+      const aMax = Math.max(...a.reassessedAssessments.map(r => r.originalPct));
+      const bMax = Math.max(...b.reassessedAssessments.map(r => r.originalPct));
+      return bMax - aMax;
+    });
+
+  // ── Analytics CSV export ────────────────────────────────────────────────────
+  const buildAnalyticsCSV = () => {
+    // Collect all unique assessment names in chronological order
+    const allAssessmentNames = [];
+    const seen = new Set();
+    enriched.forEach(s => {
+      s.history.forEach(h => {
+        if (!seen.has(h.assessment)) { seen.add(h.assessment); allAssessmentNames.push(h.assessment); }
+      });
+    });
+    if (!seen.has(assessmentName)) allAssessmentNames.push(assessmentName);
+
+    const headerRow = ["StudentID", "StudentName", "Subgroups",
+      ...allAssessmentNames.flatMap(a => [`${a}|Date`, `${a}|Score`, `${a}|Reassessed`])];
+    const today = new Date().toISOString().split("T")[0];
+
+    const dataRows = enriched.map(s => {
+      const subStr = s.subgroups.join(";");
+      const assessCols = allAssessmentNames.flatMap(a => {
+        if (a === assessmentName) {
+          // Current assessment: store original score in |Reassessed if it changed
+          const r = s.reassessedAssessments.find(r => r.assessment === a);
+          return [today, s.pct.toString(), r ? r.originalPct.toString() : ""];
+        }
+        // Prior assessment: get from history, carry forward any reassessment original
+        const h = s.history.find(h => h.assessment === a);
+        if (!h) return ["", "", ""];
+        // Check if this assessment was reassessed in this session
+        const r = s.reassessedAssessments.find(r => r.assessment === a);
+        // If reassessed this session, store original in |Reassessed
+        // If it was previously reassessed (in Analytics CSV), carry that forward via h.originalScore
+        const originalScore = r
+          ? r.originalPct.toString()
+          : (h.originalScore !== null && h.originalScore !== undefined ? h.originalScore.toString() : "");
+        return [(h.date || ""), h.score.toString(), originalScore];
+      });
+      return [s.studentId || "", s.name, subStr, ...assessCols];
+    });
+
+    const escape = (v) => {
+      const sv = String(v);
+      return sv.includes(",") || sv.includes('"') || sv.includes("\n") ? `"${sv.replace(/"/g, '""')}"` : sv;
+    };
+    return [headerRow, ...dataRows].map(row => row.map(escape).join(",")).join("\n");
+  };
+
+  return { enriched, subgroupStats, classAvg, totalStudents, reassessments, buildAnalyticsCSV };
 }
 
 // ─── Section Card ─────────────────────────────────────────────────────────────
@@ -604,8 +722,15 @@ function App() {
     const notProficient = allPcts.length - proficient;
     const proficiencyPct = allPcts.length > 0 ? Math.round((proficient / allPcts.length) * 100) : 0;
 
-    setReport({ stats, dist, proficient, notProficient, proficiencyPct, totalStudents: allPcts.length });
     const gd = buildGrowthData(sections, currentAssessmentName, subgroupMap, priorMap);
+    // Count students whose score changed (reassessed) and who crossed into proficiency via reassessment
+    const reassessedCount = gd.reassessments.length;
+    // Count how many individual assessment instances crossed into proficiency
+    const reassessedToProfCount = gd.reassessments
+      .flatMap(s => s.reassessedAssessments)
+      .filter(r => r.crossedProficiency).length;
+
+    setReport({ stats, dist, proficient, notProficient, proficiencyPct, totalStudents: allPcts.length, reassessedCount, reassessedToProfCount });
     setGrowthData(gd);
     setActiveTab("analysis");
   };
@@ -838,7 +963,7 @@ function App() {
         )}
 
         {activeTab === "analysis" && report && (() => {
-          const { stats, dist, proficient, notProficient, proficiencyPct, totalStudents } = report;
+          const { stats, dist, proficient, notProficient, proficiencyPct, totalStudents, reassessedCount, reassessedToProfCount } = report;
           // hasPrior = true when any student has in-file prior columns OR cross-trimester analytics
           const hasPrior = sections.some(sec => sec.historyCols.length > 0) || (priorMap && Object.keys(priorMap).length > 0);
 
@@ -874,7 +999,12 @@ function App() {
                 <div style={{ background: "white", borderRadius: 10, padding: "1rem 1.25rem", boxShadow: "0 1px 4px rgba(15,23,42,0.07)", marginBottom: "1rem" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
                     <span style={{ fontWeight: 700, color: "#0f172a", fontSize: "0.88rem" }}>Proficiency Rate (≥70%)</span>
-                    <span style={{ fontWeight: 800, fontSize: "1.1rem", color: proficiencyPct >= 70 ? "#15803d" : "#dc2626" }}>{proficiencyPct}%</span>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
+                      <span style={{ fontWeight: 800, fontSize: "1.1rem", color: proficiencyPct >= 70 ? "#15803d" : "#dc2626" }}>{proficiencyPct}%</span>
+                      {reassessedToProfCount > 0 && (
+                        <span style={{ fontSize: "0.72rem", color: "#7c3aed", fontWeight: 700 }}>({reassessedToProfCount} via reassessment)</span>
+                      )}
+                    </div>
                   </div>
                   <div style={{ height: 10, background: "#e2e8f0", borderRadius: 5, overflow: "hidden", marginBottom: "0.4rem" }}>
                     <div style={{ width: proficiencyPct + "%", height: "100%", background: proficiencyPct >= 70 ? "#15803d" : proficiencyPct >= 50 ? "#d97706" : "#dc2626", borderRadius: 5, transition: "width 0.5s" }} />
@@ -1126,6 +1256,117 @@ function App() {
                 );
               })()}
 
+              {/* ── REASSESSMENT TRACKER ── */}
+              {growthData && growthData.reassessments.length > 0 && (() => {
+                const items = growthData.reassessments;
+
+                // Flatten all reassessed instances for summary counts
+                const allInstances = items.flatMap(s => s.reassessedAssessments);
+                const crossedCount = allInstances.filter(r => r.crossedProficiency).length;
+                const alreadyProfCount = allInstances.filter(r => !r.crossedProficiency && r.originalPct >= 70).length;
+                const stillBelowCount = allInstances.filter(r => !r.crossedProficiency && r.originalPct < 70).length;
+                // Multi-assessment reassessors: reassessed on 2+ tests this session or had prior reassessments in history
+                const multiReassessors = items.filter(s =>
+                  s.reassessedAssessments.length > 1 ||
+                  s.history.some(h => h.originalScore !== null && h.originalScore !== undefined)
+                );
+
+                const gradeLabel = (pct) => pct >= 90 ? "A" : pct >= 80 ? "B" : pct >= 70 ? "C" : pct >= 60 ? "D" : "F";
+                const gradeColor = (pct) => pct >= 90 ? "#15803d" : pct >= 80 ? "#65a30d" : pct >= 70 ? "#d97706" : pct >= 60 ? "#ea580c" : "#dc2626";
+                const gradeBg   = (pct) => pct >= 90 ? "#dcfce7" : pct >= 80 ? "#f0fdf4" : pct >= 70 ? "#fef9c3" : pct >= 60 ? "#fff7ed" : "#fee2e2";
+
+                return (
+                  <div style={{ marginBottom: "1.75rem" }}>
+                    <h2 style={{ color: "#0f172a", fontSize: "1rem", fontWeight: 700, margin: "0 0 0.25rem", fontFamily: "'Lora', serif" }}>🔄 Reassessment Tracker</h2>
+                    <p style={{ fontSize: "0.78rem", color: "#64748b", margin: "0 0 0.75rem", lineHeight: 1.5 }}>
+                      Students whose scores changed since the last session, sorted by original score (highest first). Each row shows all assessments that changed for that student. Key PLC question: are the students reassessing those who were already proficient, or those who needed additional support?
+                    </p>
+
+                    {/* Summary chips */}
+                    <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+                      <span style={{ background: "#f5f3ff", color: "#7c3aed", borderRadius: 20, padding: "0.2rem 0.7rem", fontSize: "0.72rem", fontWeight: 700 }}>{items.length} students · {allInstances.length} reassessment{allInstances.length !== 1 ? "s" : ""}</span>
+                      {crossedCount > 0 && <span style={{ background: "#dcfce7", color: "#15803d", borderRadius: 20, padding: "0.2rem 0.7rem", fontSize: "0.72rem", fontWeight: 700 }}>✓ {crossedCount} crossed into proficiency</span>}
+                      {alreadyProfCount > 0 && <span style={{ background: "#fef9c3", color: "#92400e", borderRadius: 20, padding: "0.2rem 0.7rem", fontSize: "0.72rem", fontWeight: 700 }}>⚠ {alreadyProfCount} already proficient</span>}
+                      {stillBelowCount > 0 && <span style={{ background: "#fee2e2", color: "#dc2626", borderRadius: 20, padding: "0.2rem 0.7rem", fontSize: "0.72rem", fontWeight: 700 }}>✗ {stillBelowCount} still below proficiency</span>}
+                      {multiReassessors.length > 0 && <span style={{ background: "#fff7ed", color: "#c2410c", borderRadius: 20, padding: "0.2rem 0.7rem", fontSize: "0.72rem", fontWeight: 700 }}>↻ {multiReassessors.length} reassessed on multiple assessments</span>}
+                    </div>
+
+                    <div style={{ background: "white", borderRadius: 10, overflow: "hidden", border: "1px solid #e2e8f0" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
+                        <thead>
+                          <tr style={{ background: "#f8fafc" }}>
+                            {["Student", ...(sections.length > 1 ? ["Teacher"] : []), "Assessment", "Original", "Reassessed", "Outcome"].map(h => (
+                              <th key={h} style={{ padding: "0.5rem 0.75rem", textAlign: "left", fontWeight: 700, color: "#374151", borderBottom: "2px solid #e2e8f0", fontSize: "0.72rem", whiteSpace: "nowrap" }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {items.flatMap((s, si) => {
+                            // Sort this student's reassessments: current assessment last, rest in order
+                            const sorted = [...s.reassessedAssessments].sort((a, b) => {
+                              if (a.assessment === currentAssessmentName) return 1;
+                              if (b.assessment === currentAssessmentName) return -1;
+                              return 0;
+                            });
+                            const isMulti = s.reassessedAssessments.length > 1 ||
+                              s.history.some(h => h.originalScore !== null && h.originalScore !== undefined);
+                            return sorted.map((r, ri) => {
+                              const gain = r.newPct - r.originalPct;
+                              const origWasProf = r.originalPct >= 70;
+                              const rowBg = si % 2 === 0 ? "white" : "#fafafa";
+                              const isFirstRow = ri === 0;
+                              return (
+                                <tr key={`${si}-${ri}`} style={{ borderBottom: ri === sorted.length - 1 ? "2px solid #e2e8f0" : "1px solid #f1f5f9", background: rowBg }}>
+                                  {/* Student name only on first row, spanning all assessment rows */}
+                                  <td style={{ padding: "0.45rem 0.75rem", fontWeight: 600, verticalAlign: "top", color: "#0f172a" }}>
+                                    {isFirstRow ? (
+                                      <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                                        {s.name}
+                                        {isMulti && <span style={{ background: "#fff7ed", color: "#c2410c", borderRadius: 4, padding: "0.05rem 0.35rem", fontSize: "0.62rem", fontWeight: 800 }}>↻ multi</span>}
+                                      </div>
+                                    ) : ""}
+                                  </td>
+                                  {sections.length > 1 && (
+                                    <td style={{ padding: "0.45rem 0.75rem", verticalAlign: "top" }}>
+                                      {isFirstRow ? <span style={{ background: "#f0fdfa", color: "#0f766e", borderRadius: 20, padding: "0.1rem 0.4rem", fontSize: "0.68rem", fontWeight: 600 }}>{s.teacherName || s.teacherLabel}</span> : ""}
+                                    </td>
+                                  )}
+                                  <td style={{ padding: "0.45rem 0.75rem", color: "#475569", fontSize: "0.75rem" }}>
+                                    {r.assessment}
+                                    {r.assessment === currentAssessmentName && <span style={{ marginLeft: "0.3rem", fontSize: "0.62rem", color: "#0f766e", fontWeight: 700 }}>current</span>}
+                                  </td>
+                                  <td style={{ padding: "0.45rem 0.75rem" }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
+                                      <span style={{ background: gradeBg(r.originalPct), color: gradeColor(r.originalPct), borderRadius: 4, padding: "0.1rem 0.35rem", fontSize: "0.72rem", fontWeight: 800 }}>{gradeLabel(r.originalPct)}</span>
+                                      <span style={{ fontWeight: 600 }}>{r.originalPct}%</span>
+                                    </div>
+                                  </td>
+                                  <td style={{ padding: "0.45rem 0.75rem" }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
+                                      <span style={{ background: gradeBg(r.newPct), color: gradeColor(r.newPct), borderRadius: 4, padding: "0.1rem 0.35rem", fontSize: "0.72rem", fontWeight: 800 }}>{gradeLabel(r.newPct)}</span>
+                                      <span style={{ fontWeight: 600 }}>{r.newPct}%</span>
+                                      <span style={{ color: "#15803d", fontSize: "0.7rem", fontWeight: 700 }}>(+{gain}%)</span>
+                                    </div>
+                                  </td>
+                                  <td style={{ padding: "0.45rem 0.75rem" }}>
+                                    {r.crossedProficiency
+                                      ? <span style={{ background: "#dcfce7", color: "#15803d", borderRadius: 4, padding: "0.1rem 0.45rem", fontSize: "0.7rem", fontWeight: 700 }}>Not Prof → Proficient</span>
+                                      : origWasProf
+                                        ? <span style={{ background: "#fef9c3", color: "#92400e", borderRadius: 4, padding: "0.1rem 0.45rem", fontSize: "0.7rem", fontWeight: 700 }}>Already Proficient</span>
+                                        : <span style={{ background: "#fee2e2", color: "#dc2626", borderRadius: 4, padding: "0.1rem 0.45rem", fontSize: "0.7rem", fontWeight: 700 }}>Still Not Proficient</span>
+                                    }
+                                  </td>
+                                </tr>
+                              );
+                            });
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* ── EXPORT ACTIONS ── */}
               <div className="no-print" style={{ borderTop: "1px solid #e2e8f0", paddingTop: "1.5rem", marginTop: "0.5rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
                 {/* PDF Export */}
@@ -1183,6 +1424,33 @@ function App() {
                     ⬇ Download PDF
                   </button>
                 </div>
+
+                {/* Analytics CSV Export */}
+                {growthData && (
+                  <div style={{ background: "#f0fdfa", border: "1px solid #99f6e4", borderRadius: 10, padding: "1rem 1.25rem" }}>
+                    <div style={{ fontWeight: 700, color: "#0f172a", fontSize: "0.9rem", marginBottom: "0.3rem" }}>📥 Save Analytics for Next Session</div>
+                    <p style={{ fontSize: "0.78rem", color: "#475569", margin: "0 0 0.75rem" }}>
+                      Download and upload this file next session alongside the new IC gradebook export. It enables risk tracking, reassessment detection, and cross-assessment pattern analysis.
+                    </p>
+                    <button
+                      onClick={() => {
+                        try {
+                          const csv = growthData.buildAnalyticsCSV();
+                          const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement("a");
+                          a.href = url; a.download = (currentAssessmentName || "Assessment") + "_Analytics.csv";
+                          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                          URL.revokeObjectURL(url);
+                        } catch(e) {
+                          alert("Download failed: " + e.message);
+                        }
+                      }}
+                      style={{ background: "#0f766e", color: "white", border: "none", borderRadius: 8, padding: "0.5rem 1.2rem", fontSize: "0.85rem", fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+                      ⬇ Download Analytics CSV
+                    </button>
+                  </div>
+                )}
 
               </div>
             </div>
